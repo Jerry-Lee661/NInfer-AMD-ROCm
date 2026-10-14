@@ -1,0 +1,6 @@
+build/
+build-cuda/
+dist/
+*.o
+*.obj
+__pycache__/
