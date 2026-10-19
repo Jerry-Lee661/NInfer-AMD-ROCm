@@ -103,16 +103,22 @@ TernaryLaunch select_ternary_launch(std::int32_t n, std::int32_t k, std::int32_t
 TernaryS8Scratch allocate_ternary_s8_scratch(WorkspaceArena& workspace, std::int32_t k,
                                              std::int32_t tokens) {
     TernaryS8Scratch scratch{};
-    // dp4a rung(PQ2 decode GEMV/tile, T≤4): 门开即从同一 arena 分配。这里看不到 qtype,
-    // PTQ1/BF16 权重会白拿几 KB scratch, launch 侧的 PQ2 条件会安全落回 bf16 arm。
-    // 容量端: 通用路径 = ternary_rotation_workspace_bytes 的 dp4a 片(按 T=4 计)✓;
+    // dp4a rung(PQ2 decode GEMV/tile, T≤kPq2Dp4aMaxTokens): 门开即从同一 arena 分配。这里看不到
+    // qtype, PTQ1/BF16 权重会白拿几 KB scratch, launch 侧的 PQ2 条件会安全落回 bf16 arm。
+    // 容量端: 通用路径 = ternary_rotation_workspace_bytes 的 dp4a 片(按 rung 上限计)✓;
     // wrapper 叶池 = cut3 的容量补丁(见 gdn_input_proj/attn_input_proj 容量函数),
     // 2026-10-03 首版因叶池未计片而越界(arena 现抛带实数的 overflow)。
-    if (tokens >= 1 && tokens <= 4 && ternary_pq2_dp4a_enabled() && (k % 128) == 0) {
+    if (tokens >= 1 && tokens <= kPq2Dp4aMaxTokens && ternary_pq2_dp4a_enabled() &&
+        (k % 128) == 0) {
         const DeviceSpan xq  = workspace.alloc_bytes(ternary_pq2_dp4a_xq_bytes(k, tokens));
         const DeviceSpan ds8 = workspace.alloc_bytes(ternary_pq2_dp4a_ds8_bytes(k, tokens));
         scratch.dp4a_xq      = static_cast<std::int8_t*>(xq.data);
         scratch.dp4a_ds8     = static_cast<std::uint16_t*>(ds8.data);
+        // split-K 部分和片(M4-T1d): tokens < 2 时为 0 字节(不分配), T=1 零代价。
+        if (const std::size_t ks_bytes = ternary_pq2_iu8_ksplit_bytes(tokens); ks_bytes > 0) {
+            const DeviceSpan ksp = workspace.alloc_bytes(ks_bytes);
+            scratch.dp4a_ksplit  = static_cast<float*>(ksp.data);
+        }
     }
     if (tokens < kTernaryS8MinTokens) {
         // Below the int8 rung's threshold the rung is not taken, so the scratch would be wasted
@@ -130,8 +136,32 @@ TernaryS8Scratch allocate_ternary_s8_scratch(WorkspaceArena& workspace, std::int
 void ternary_dispatch_basis_strided(const Tensor& x_folded, const Weight& w, Tensor& out,
                                     std::int32_t out_row_stride, LinearPolicy policy,
                                     cudaStream_t stream, TernaryS8Scratch scratch) {
-    // dp4a rung(NINFER_PQ2_DP4A=1, T=1..4): 置于 small-T WMMA 之前, 与 WMMA 正面 A/B。
-    // 门关/scratch 空(容量端没分)时条件不成立, 落回原路由。判据与"旋转延迟"共用一份(M2)。
+    // 2026-10-08 (转GEMM 线2): NINFER_VERIFY_T2V2=1 时 t 2..8 的 strided 投影改走 t2v2
+    // (上游 t2_small_t_v2 移植件, T=1 A/B 与 dp4a GEMV 逐位一致同速; verify 摊销假设的
+    // 对照臂)。默认关; =0 恢复 WMMA。
+    // 2026-10-17 (T7 设计轮): 检查提到 dp4a rung 之前 —— 默认配置下 dp4a(T≤4)先接管,
+    // 本臂原先不可达(端口), 提到前面才可被 A/B 实测; rot_deferred 排除(激活未旋转,
+    // t2v2 读 bf16 激活无融合旋转路径, 落回 dp4a 上提臂)。
+    static const bool verify_t2v2 = []() {
+        const char* v = std::getenv("NINFER_VERIFY_T2V2");
+        return v != nullptr && std::strcmp(v, "0") != 0;
+    }();
+    if (verify_t2v2 && !scratch.rot_deferred() && x_folded.ne[1] >= 2 &&
+        x_folded.ne[1] <= 8 && w.qtype == QType::PQ2_0_G128 && (w.n % 16) == 0 &&
+        (w.k % 512) == 0 && w.padded_shape[1] == w.k) {
+        const unsigned t2_grid = static_cast<unsigned>(w.n / 16);
+        tern_t2v2_kernel<TernaryT2v2Schedule<8, 1, 1, 2, 6>>
+            <<<t2_grid, 256, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x_folded.data),
+                static_cast<const std::uint8_t*>(w.qdata),
+                static_cast<const std::uint8_t*>(w.scales),
+                static_cast<__nv_bfloat16*>(out.data), w.n, w.k, x_folded.ne[1],
+                out_row_stride);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // dp4a rung(NINFER_PQ2_DP4A=1, T=1..kPq2Dp4aMaxTokens): 置于 small-T WMMA 之前, 与 WMMA
+    // 正面 A/B。门关/scratch 空(容量端没分)时条件不成立, 落回原路由。判据与"旋转延迟"共用一份(M2)。
     if (ternary_pq2_dp4a_admits(x_folded, w, scratch)) {
         launch_pq2_dp4a_tile(x_folded, w, out, out_row_stride, stream, scratch);
         return;
@@ -145,27 +175,6 @@ void ternary_dispatch_basis_strided(const Tensor& x_folded, const Weight& w, Ten
     // out_row_stride may differ from w.n (verify-fused qkv buffers, e.g. 10240-stride gdn/attn
     // projections): the kernel writes [col * stride + row], so the strided layouts stay on WMMA
     // instead of falling back to the FMA-sim rungs (measured 6.8x gdn_proj round cost, B1).
-    // 2026-10-08 (转GEMM 线2): NINFER_VERIFY_T2V2=1 时 t 2..8 的 strided 投影改走 t2v2
-    // (上游 t2_small_t_v2 移植件, T=1 A/B 与 dp4a GEMV 逐位一致同速; verify 摊销假设的
-    // 对照臂)。默认关; =0 恢复 WMMA。
-    static const bool verify_t2v2 = []() {
-        const char* v = std::getenv("NINFER_VERIFY_T2V2");
-        return v != nullptr && std::strcmp(v, "0") != 0;
-    }();
-    if (verify_t2v2 && x_folded.ne[1] >= 2 && x_folded.ne[1] <= 8 &&
-        w.qtype == QType::PQ2_0_G128 && (w.n % 16) == 0 && (w.k % 512) == 0 &&
-        w.padded_shape[1] == w.k) {
-        const unsigned t2_grid = static_cast<unsigned>(w.n / 16);
-        tern_t2v2_kernel<TernaryT2v2Schedule<8, 1, 1, 2, 6>>
-            <<<t2_grid, 256, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x_folded.data),
-                static_cast<const std::uint8_t*>(w.qdata),
-                static_cast<const std::uint8_t*>(w.scales),
-                static_cast<__nv_bfloat16*>(out.data), w.n, w.k, x_folded.ne[1],
-                out_row_stride);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
     if (smallt_wmma_admits(w, x_folded.ne[1])) {
         launch_smallt_wmma(x_folded, w, out, out_row_stride, stream);
         return;
@@ -250,7 +259,7 @@ bool ternary_dispatch_add(const Tensor& x, const Weight& w, Tensor& residual_out
     (void)policy;
     // 外层条件 = dp4a 分支的判据减去 scratch 测试(scratch 在下面才分配), 与
     // ternary_dispatch 的 dp4a 分支同形。不满足就返回 false, 由调用方 compose。
-    if (!ternary_res_fuse_enabled() || workspace == nullptr || x.ne[1] > 4 ||
+    if (!ternary_res_fuse_enabled() || workspace == nullptr || x.ne[1] > kPq2Dp4aMaxTokens ||
         !ternary_pq2_dp4a_enabled() || w.qtype != QType::PQ2_0_G128 ||
         w.padded_shape[1] != w.k || (w.k % 128) != 0) {
         return false;
@@ -275,9 +284,25 @@ bool ternary_dispatch_add(const Tensor& x, const Weight& w, Tensor& residual_out
 
 void ternary_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                       WorkspaceArena* workspace, cudaStream_t stream) {
-    // dp4a verify-tile rung(NINFER_PQ2_DP4A=1, T=1..4): 同 strided 入口, WMMA 之前 A/B。
-    if (x.ne[1] <= 4 && ternary_pq2_dp4a_enabled() && w.qtype == QType::PQ2_0_G128 &&
-        w.padded_shape[1] == w.k && (w.k % 128) == 0 && workspace != nullptr) {
+    // dp4a verify-tile rung(NINFER_PQ2_DP4A=1, T=1..kPq2Dp4aMaxTokens): 同 strided 入口,
+    // WMMA 之前 A/B。
+    if (x.ne[1] <= kPq2Dp4aMaxTokens && ternary_pq2_dp4a_enabled() &&
+        w.qtype == QType::PQ2_0_G128 && w.padded_shape[1] == w.k && (w.k % 128) == 0 &&
+        workspace != nullptr) {
+        // 2026-10-17 (T7 设计轮): verify 宽度(t 2..16) 的 WMMA 摊销对照臂。dp4a tile 每列
+        // 增加一条 dp4a+2 加载的指令流(权重单读、指令线性), WMMA 把列装进片段(权重 LDS
+        // 一次、列内循环)。默认关; =0/未设 = 现行 dp4a。旋转走 eager(folded_activation,
+        // WMMA 读已旋转 bf16, 无 defer)。
+        static const bool verify_smallt = []() {
+            const char* v = std::getenv("NINFER_VERIFY_SMALLT");
+            return v != nullptr && std::strcmp(v, "0") != 0;
+        }();
+        if (verify_smallt && x.ne[1] >= 2 && smallt_wmma_admits(w, x.ne[1])) {
+            auto scope               = workspace->scope();
+            const Tensor activation  = folded_activation(x, w, *workspace, stream);
+            launch_smallt_wmma(activation, w, out, w.n, stream);
+            return;
+        }
         auto scope = workspace->scope();
         TernaryS8Scratch scratch{};
         const DeviceSpan xq  = workspace->alloc_bytes(ternary_pq2_dp4a_xq_bytes(w.k, x.ne[1]));

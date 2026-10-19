@@ -48,6 +48,11 @@ struct Variant {
                                      Tensor& gate, Tensor& key, Tensor& value,
                                      qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                      cudaStream_t stream);
+    // T5 片 3: 输入投影链(27b 线专用)。35b_a3b 未接线, 恒返回 false 走原路径。
+    [[nodiscard]] static bool attention_input_chain(
+        const Tensor& x_raw, const Tensor& norm_weight, float eps,
+        const FullAttentionProjectionWeights& weights, Tensor& query, Tensor& gate, Tensor& key,
+        Tensor& value, Tensor& hidden, WorkspaceArena& workspace, cudaStream_t stream);
     static void attention_output_projection(const Tensor& attention, const Weight& weight,
                                             Tensor& residual, qwen3_6::TextPhase phase,
                                             WorkspaceArena& workspace, cudaStream_t stream);
@@ -83,6 +88,12 @@ struct Variant {
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, Tensor& g, Tensor& beta,
                                             WorkspaceArena& workspace, cudaStream_t stream);
+    // T5 片 3b 刀一(gdn 前置链, 27b 线专用)。35b_a3b 未接线, 恒返回 false。
+    [[nodiscard]] static bool gdn_norm_gating_chain(const Tensor& x_raw,
+                                                    const Tensor& norm_weight, float eps,
+                                                    const GdnProjectionWeights& weights,
+                                                    Tensor& hidden, Tensor& g, Tensor& beta,
+                                                    cudaStream_t stream);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);
@@ -122,6 +133,10 @@ struct Variant {
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
                                         std::int32_t first, std::int32_t last);
+    // Activation scratch the output head needs on the shared sequence workspace (causal scoring).
+    [[nodiscard]] static std::size_t
+    output_head_workspace_capacity_bytes(WeightsProfile weights_profile, std::int32_t first,
+                                         std::int32_t last);
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                                              std::int32_t last);
 };

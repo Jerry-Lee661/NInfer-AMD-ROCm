@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -27,6 +28,19 @@ namespace {
 constexpr int kBlockSize      = 1024;
 constexpr int kWarpsPerBlock  = 8;
 constexpr int kThreadsPerWarp = 32;
+
+// HIP wave64 的 __shfl_*_sync 静态要求 64 位 mask(warp.cuh/hadamard_d256.cuh 同惯例);
+// stride ≤ 16 时 xor partner 恒在同一 32 lane 半波内, 逻辑语义与 CUDA 32 lane 一致。
+// kHalfMask16 只点名 lane 0-15(causal 树收尾的 warp 0 前 16 lane)。
+constexpr unsigned long long kFullMask   = 0xffffffffffffffffULL;
+constexpr unsigned long long kHalfMask16 = 0x0000ffffULL;
+
+// T3(2026-10-15, M3-1)融合核开关。默认关;按值解析(仅 "1" 开, 存在性判定是坑 #2)。
+// 接线(T4)在 ternary_rotation.cu 的 dispatch 处引用; 选择决定哪条链进图, 读一次。
+[[nodiscard]] inline bool rmsnorm_rotq_fuse_enabled() {
+    const char* value = std::getenv("NINFER_RMSNORM_ROTQ_FUSE");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
 
 // D1024 = 32 lanes x 32 registers: normalized_hadamard_d1024_inplace 已提升到公共头
 // (ops/kv_cache/hadamard_d256.cuh,2026-10-09 M2e 单一事实源),此处直接用。
@@ -230,6 +244,9 @@ __global__ __launch_bounds__(256) void ternary_rotate_quant_q8_v3_kernel(
 
     // stage bit8:切片对 (0,2) / (1,3);low(q bit=0)= own+partner,high = own−partner。
     // stage bit9:切片对 (0,1) / (2,3) 作用于 stage8 结果。
+    // ⚠️ 读伙伴槽与写回自己槽之间必须整块同步(2026-10-15, T3 探针实锤): 无屏障时
+    // partner warp 可能在本 warp 读它之前写回 => 整组错码(双跑非确定, T=32 下
+    // v3a-vs-v3b 差 1397 码, scale 最大 2.67x)。屏障放在 active 门之外(分歧屏障 = UB)。
     if (active) {
         const float* own    = ex[threadIdx.x >> 5];
         const float* partner = ex[(threadIdx.x >> 5) ^ 2];  // 同 CTA 同块的 partner warp(块 0 之外 warp_in_cta ≠ warp_q)
@@ -239,6 +256,9 @@ __global__ __launch_bounds__(256) void ternary_rotate_quant_q8_v3_kernel(
             values[r] = pb ? __fsub_rn(partner[lane + 32 * r], own[lane + 32 * r])
                            : __fadd_rn(own[lane + 32 * r], partner[lane + 32 * r]);
         }
+    }
+    __syncthreads();
+    if (active) {
         float* u = ex[threadIdx.x >> 5];
 #pragma unroll
         for (int r = 0; r < 8; ++r) { u[lane + 32 * r] = values[r]; }
@@ -285,6 +305,159 @@ __global__ __launch_bounds__(256) void ternary_rotate_quant_q8_v3_kernel(
 #pragma unroll
             for (int i = 0; i < 32; ++i) {
                 const int qv = std::lrint(lw[g * 33 + i] * inv);
+                xq_token[(block << 10) + (warp_q * 8 + g) * 32 + i] =
+                    static_cast<std::int8_t>(std::max(-127, std::min(127, qv)));
+            }
+        }
+    }
+}
+
+// T3(2026-10-15, M3-1): rmsnorm(unit-offset 端标) + 旋转 + q8_1 量化, 单核。
+//
+// 替代两核路径(launcher/rmsnorm.cu 的 rmsnorm_cta_bf16x2_kernel<Offset,512,8> -> v3 旋转量化)
+// 中"范数喂旋转"的位点(64 层 x input_norm/post_attn_norm)。CTA = 640 线程 = 20 warp,
+// 一 CTA 一整行(k=5120 = 5 块 x 4 warp);warp 的 block = w>>2、切片 warp_q = w&3,
+// 与 v3 完全同映射。范数平方和 = 每 lane 8 维瓦片序 + 全 warp 蝶形 + 16 路 LDS 树;
+// 归约序与 rmsnorm_cta(512 线程 5 对平铺)不同 => 非 bit-exact(设计接受的漂移, PPL 门量它)。
+// 舍入点与两核路径对齐: y 落一次 bf16 再进 sign/Hadamard; 全部 Hadamard 阶段之后再落
+// 一次 bf16 再量化(v2/v3 中间缓冲舍入的等价点)。量化表达式逐字照抄 v3。
+//
+// LDS: 单池 pool[20][264](21.1 KiB < 32 KiB 启动税线)。前 256 作位 8/9 交接;所有伙伴读毕
+// (块级栅栏后)复用为量化 8x33 转置。⚠️ 转置写入前必须等最后一位伙伴读完 —— 因此位 9 之后
+// 额外一个 __syncthreads 与 v3 不同(语义安全, 非分歧屏障)。
+__global__ __launch_bounds__(640) void ternary_rmsnorm_rotate_quant_q8_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, float eps,
+    std::int8_t* __restrict__ xq, std::uint16_t* __restrict__ ds8,
+    const float* __restrict__ signs, int n_blk, int k, int tokens, int perm_hd, int perm_nk,
+    int perm_rep) {
+    const int lane     = threadIdx.x & 31;
+    const int cta_warp = static_cast<int>(threadIdx.x) >> 5;   // 0..19
+    const int blocks   = k >> 10;
+    if (blocks != 5) { return; }    // 融合只服务 k=5120(范数行宽; 全体一致, 栅栏安全)
+    const int token = static_cast<int>(blockIdx.x);
+    if (token >= tokens) { return; }
+    const int block  = cta_warp >> 2;                          // 0..4
+    const int warp_q = cta_warp & 3;                           // 块内 256 切片
+    const int qbase  = warp_q * 256;
+
+    const float* const signs_row = signs + (block % n_blk) * kBlockSize;
+    const bool permuted          = perm_rep > 1;
+    const __nv_bfloat16* x_token = x + static_cast<std::int64_t>(token) * k;
+    std::int8_t* const xq_token  = xq + static_cast<std::int64_t>(token) * k;
+    std::uint16_t* const ds_token = ds8 + static_cast<std::int64_t>(token) * (k >> 5);
+
+    __shared__ float pool[20][264];   // 前 256 = 交接; 复用 = 量化转置 8x33
+    __shared__ float norm_sums[20];
+    __shared__ float norm_inv;
+
+    const int slot = (block << 10) + qbase;
+
+    // 相位 1: 装载(折叠 P)+ 平方和。元素集合是 P 的像 = 整行(双射, 平方和不变)。
+    float xraw[8];
+    float partial = 0.0f;
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int column = slot + r * 32 + lane;
+        int source       = column;
+        if (permuted) {
+            const int hd = column % perm_hd;
+            const int q  = column / perm_hd;
+            source = hd + perm_hd * (q / perm_rep) + perm_hd * perm_nk * (q % perm_rep);
+        }
+        const float xv = __bfloat162float(x_token[source]);
+        xraw[r]        = xv;
+        partial += xv * xv;
+    }
+#pragma unroll
+    for (int st = 16; st > 0; st >>= 1) {
+        partial += __shfl_xor_sync(kFullMask, partial, st);
+    }
+    if (lane == 0) { norm_sums[cta_warp] = partial; }
+    __syncthreads();
+    if (cta_warp == 0 && lane < 16) {
+        float v = norm_sums[lane];
+        if (lane < 4) { v += norm_sums[lane + 16]; }
+#pragma unroll
+        for (int st = 8; st > 0; st >>= 1) {
+            v += __shfl_xor_sync(kHalfMask16, v, st);
+        }
+        if (lane == 0) { norm_inv = rsqrtf(v / static_cast<float>(k) + eps); }
+    }
+    __syncthreads();
+    const float inv = norm_inv;
+
+    // 相位 2: y = bf16((x*inv)*(w+1)) -> sign -> D256。w+1 = unit-offset 端标(现行 5120 范数口径)。
+    float values[8];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int column = slot + r * 32 + lane;
+        int source       = column;
+        if (permuted) {
+            const int hd = column % perm_hd;
+            const int q  = column / perm_hd;
+            source = hd + perm_hd * (q / perm_rep) + perm_hd * perm_nk * (q % perm_rep);
+        }
+        const float wf = __bfloat162float(weight[source]) + 1.0f;
+        const float y  = __fmul_rn(__fmul_rn(xraw[r], inv), wf);
+        values[r]      = __fmul_rn(__bfloat162float(__float2bfloat16_rn(y)),
+                                   signs_row[qbase + r * 32 + lane]);
+    }
+
+    normalized_hadamard_d256_inplace(values, lane);
+
+    float* const own = &pool[cta_warp][0];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) { own[lane + 32 * r] = values[r]; }
+    __syncthreads();
+    {
+        const float* partner = &pool[cta_warp ^ 2][0];   // 同块 partner warp
+        const int pb         = (warp_q & 2) ? 1 : 0;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            values[r] = pb ? __fsub_rn(partner[lane + 32 * r], own[lane + 32 * r])
+                           : __fadd_rn(own[lane + 32 * r], partner[lane + 32 * r]);
+        }
+        // 读-写回之间必须整块同步:partner warp 写回自己的行时, 本 warp 可能还没读完它
+        // (20 warp 实测咬中, 见 probe_rmsnorm_rotq_fuse 双跑非确定)。v3 同结构 T=32 下
+        // 同样咬中(v3a-vs-v3b 差 1397 码), 已同步修复。
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < 8; ++r) { own[lane + 32 * r] = values[r]; }
+    }
+    __syncthreads();
+    {
+        const float* partner = &pool[cta_warp ^ 1][0];
+        const int pb         = (warp_q & 1) ? 1 : 0;
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            values[r] = pb ? __fsub_rn(partner[lane + 32 * r], own[lane + 32 * r])
+                           : __fadd_rn(own[lane + 32 * r], partner[lane + 32 * r]);
+        }
+        // 跨 warp 两阶段各带一个 2^-1(D256 自带剩余 2^-4): 总归一 2^-5, 漏乘 = 输出恰大 2x。
+#pragma unroll
+        for (int r = 0; r < 8; ++r) { values[r] = __fmul_rn(values[r], 0x1p-1f); }
+        // 两核路径的第二次舍入点: 全部 Hadamard 之后才落 bf16。
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            values[r] = __bfloat162float(__float2bfloat16_rn(values[r]));
+        }
+    }
+    __syncthreads();   // 等所有伙伴读完本切片, 才允许复用为量化转置
+    {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) { own[r * 33 + lane] = values[r]; }
+        __syncwarp();
+        if (lane < 8) {
+            const int g = lane;
+            float amax  = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) { amax = fmaxf(amax, fabsf(own[g * 33 + i])); }
+            const float d    = amax / 127.0f;
+            const float dinv = d > 0.0f ? 1.0f / d : 0.0f;
+            ds_token[(block << 5) + warp_q * 8 + g] = __half_as_ushort(__float2half(d));
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                const int qv = std::lrint(own[g * 33 + i] * dinv);
                 xq_token[(block << 10) + (warp_q * 8 + g) * 32 + i] =
                     static_cast<std::int8_t>(std::max(-127, std::min(127, qv)));
             }

@@ -16,6 +16,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/ternary/ternary_dispatch.h"
 #include "ops/linear/ternary/ternary_launch.h"
+#include "ops/linear/ternary/ternary_mlp_chain.h"
 #include "ops/linear/ternary/ternary_row_view.h"
 #include "ops/linear/ternary/ternary_rotation.h"
 
@@ -768,6 +769,14 @@ void launch_ternary_split(const Tensor& activation, const Weight& qk_weight,
                           const Weight& value_z_weight, Tensor& qkv, Tensor& z,
                           std::int32_t qk_rows, std::int32_t value_rows, std::int32_t z_rows,
                           detail::TernaryS8Scratch scratch, cudaStream_t stream) {
+    // T5 片 3b 刀二(默认开, 逃生门 NINFER_INPUT_CHAIN=0): [rotquant(k=5120) + 三段
+    // qk|value|z GEMV] 2 节点并 1 持久核。必须早于量化上提臂 —— hoist_begin 自己会发射
+    // 旋转+量化节点, 此后链核无从回收。前提 = scratch 的旋转延迟态(T=1 的 dp4a 路径);
+    // 未准入返回 false, 下走原路径(含上提)逐位不变。
+    if (detail::ternary_segn_chain_split(activation, qk_weight, value_z_weight, qkv, z, qk_rows,
+                                         value_rows, z_rows, scratch, stream)) {
+        return;
+    }
     // Under ninfer's ne[0]-contiguous layout the token stride of the fused qkv output is its ROW
     // count, so the two halves must be told the parent's stride rather than their own.
     const std::int32_t qkv_rows = qk_rows + value_rows;
@@ -956,13 +965,15 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected_workspace(
         layout, channels, largest_materialized_width == 0 ? max_width : largest_materialized_width);
-    // dp4a rung(NINFER_PQ2_DP4A=1, T≤4)的 decode 期量化片: rotation() 内含一片, 但实测
-    // 捕获期本叶池的运行堆叠会复用/叠加(2026-10-03 实测 cap 58372 vs 需 63744), 按一份
-    // 整片外显再加, 不依赖 rotation() 的内含片作为唯一余量。
+    // dp4a rung(NINFER_PQ2_DP4A=1, T≤kPq2Dp4aMaxTokens)的 decode 期量化片 + split-K 部分和片:
+    // rotation() 内含一片, 但实测捕获期本叶池的运行堆叠会复用/叠加(2026-10-03 实测 cap 58372
+    // vs 需 63744), 按一份整片外显再加, 不依赖 rotation() 的内含片作为唯一余量。片宽 = rung
+    // 上限 / 区域上界(与内含片同口径)。
     return layout.peak_bytes(1) +
            detail::ternary_rotation_workspace_bytes(kFoldedGdnHidden, batch_size * max_width) +
-           detail::ternary_pq2_dp4a_xq_bytes(kFoldedGdnHidden, 4) +
-           detail::ternary_pq2_dp4a_ds8_bytes(kFoldedGdnHidden, 4) + 1024u;
+           detail::ternary_pq2_dp4a_xq_bytes(kFoldedGdnHidden, detail::kPq2Dp4aMaxTokens) +
+           detail::ternary_pq2_dp4a_ds8_bytes(kFoldedGdnHidden, detail::kPq2Dp4aMaxTokens) +
+           detail::ternary_pq2_iu8_ksplit_bytes(batch_size * max_width) + 1024u;
 }
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -1016,8 +1027,9 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     // it needs is the folded ternary rotation buffer (see the snapshot query above).
     // dp4a 片外显加一份, 同 conv_snapshot 尾的理由(捕获期堆叠复用, 不依赖内含片当余量)。
     return detail::ternary_rotation_workspace_bytes(kFoldedGdnHidden, batch_size * max_width) +
-           detail::ternary_pq2_dp4a_xq_bytes(kFoldedGdnHidden, 4) +
-           detail::ternary_pq2_dp4a_ds8_bytes(kFoldedGdnHidden, 4) + 1024u;
+           detail::ternary_pq2_dp4a_xq_bytes(kFoldedGdnHidden, detail::kPq2Dp4aMaxTokens) +
+           detail::ternary_pq2_dp4a_ds8_bytes(kFoldedGdnHidden, detail::kPq2Dp4aMaxTokens) +
+           detail::ternary_pq2_iu8_ksplit_bytes(batch_size * max_width) + 1024u;
 }
 
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -1109,6 +1121,15 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
             detail::allocate_ternary_s8_scratch(ws, qk_weight.k, x.ne[1]);
         const Tensor activation =
             detail::folded_activation_or_defer(x, qk_weight, ws, stream, s8_scratch);
+        // S2a(2026-10-17 剩余节点组): [rotq + 三段 segn GEMV + 投影卷积] 三合链
+        // (门 NINFER_SEGN_CONV_CHAIN=0 回退, 默认开); 未准入 = 下走原两节点路径, 逐位不变。
+        if (detail::ternary_segn_conv_chain_split(
+                activation, qk_weight, value_z_weight, scratch.projected, z,
+                kQueryRows + kKeyRows, kValueRows, kZRows, conv_weight, conv_states,
+                valid_columns, initial_state_slots, snapshot_base_slots, query, key, value,
+                kQueryRows, kKeyRows, s8_scratch, stream)) {
+            return;
+        }
         launch_ternary_split(activation, qk_weight, value_z_weight, scratch.projected, z,
                              kQueryRows + kKeyRows, kValueRows, kZRows, s8_scratch, stream);
         detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states,

@@ -11,6 +11,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
 
+#include "ops/linear/ternary/ternary_mlp_chain.h"
 #include "ops/linear/ternary/ternary_rotation.h"
 
 #include <algorithm>
@@ -183,14 +184,32 @@ void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    // T4(融合接线): arm 兜底(见 ops/linear/ternary/ternary_rotation.h)。hidden 若是被 arm 的
+    // 激活: 消费权重可纳 dp4a 延迟 => 放行(融合核接手 norm+rotate+quant); 否则补做 norm 再放行。
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
+        ops::detail::ternary_rmsnorm_rotq_guard(hidden, split->query_key, stream);
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
                              workspace, stream);
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
+    ops::detail::ternary_rmsnorm_rotq_guard(hidden, fused, stream);
     ops::attn_input_proj(hidden, fused, query, gate, key, value, text_policy(fused), workspace,
                          stream);
+}
+
+bool Variant::attention_input_chain(const Tensor& x_raw, const Tensor& norm_weight, float eps,
+                                    const FullAttentionProjectionWeights& weights, Tensor& query,
+                                    Tensor& gate, Tensor& key, Tensor& value, Tensor& hidden,
+                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    // 本 artifact 的注意力输入投影 = 双父 Split 载荷(见 load/bindings.cpp 的
+    // SplitAttentionProjectionPlan);单父 fused 载荷走动量未接的入口, 恒回落原路径。
+    if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
+        return ops::detail::ternary_input_chain_attn(x_raw, norm_weight, eps, split->query_key,
+                                                     split->gate_value, query, gate, key, value,
+                                                     hidden, workspace, stream);
+    }
+    return false;
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
@@ -315,8 +334,23 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               workspace, hidden, g, beta, stream);
 }
 
+bool Variant::gdn_norm_gating_chain(const Tensor& x_raw, const Tensor& norm_weight, float eps,
+                                    const GdnProjectionWeights& weights, Tensor& hidden, Tensor& g,
+                                    Tensor& beta, cudaStream_t stream) {
+    // 须为 Split 载荷(本 artifact 形态); fused 即回落原路径(ops::gdn_norm_gating_proj)。
+    const auto* ctrl_split =
+        std::get_if<SplitGdnControlProjectionPayload>(&weights.control_projection);
+    if (ctrl_split == nullptr) { return false; }
+    return ops::detail::ternary_norm_gating_chain(x_raw, norm_weight, eps,
+                                                  ctrl_split->a_projection,
+                                                  ctrl_split->b_projection, weights.a_log,
+                                                  weights.dt_bias, hidden, g, beta, stream);
+}
+
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    // T4(融合接线): arm 兜底(同 attention_projection; 消费端 = gate_up 的延迟旋转量化)。
+    ops::detail::ternary_rmsnorm_rotq_guard(hidden, weights.gate_up, stream);
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     // M2e(NINFER_SILUROT_FUSE=1, 默认关): silu+Hadamard 旋转合一,activation 直接写成
@@ -550,6 +584,24 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
             QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S, kFp8TextPolicy, first, last);
         return std::max(nvfp4, fp8);
     }
+    }
+    throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+}
+
+std::size_t Variant::output_head_workspace_capacity_bytes(WeightsProfile weights_profile,
+                                                          std::int32_t first, std::int32_t last) {
+    validate_token_interval(first, last);
+    switch (weights_profile) {
+    case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseInt:
+        // The folded ternary port shares the groupwise-int profile: the head consumes the raw
+        // hidden state and needs a [hidden, T] activation rotation buffer.
+        return folded_rotation_bytes(TextConfig::hidden, last);
+    case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4:
+        // Nvfp4 linear problems are restricted to the fixed attention/GDN/MLP geometries, so the
+        // nvfp4-profile head is a different (zero-scratch) format.
+        return 0;
     }
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
 }

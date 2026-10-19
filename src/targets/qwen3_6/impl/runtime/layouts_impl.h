@@ -435,6 +435,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        // The scoring flush runs the output head on this same arena right after the three score
+        // tensors, so its activation scratch belongs to this plan (2026-10-15 T2: omitting it
+        // overflowed the arena by exactly one head rotation scratch).
+        scratch(causal_score,
+                Variant::output_head_workspace_capacity_bytes(
+                    plan.weights_profile, 1, static_cast<std::int32_t>(kCausalScoreTile)));
         out.causal_score = finish(causal_score);
     }
 

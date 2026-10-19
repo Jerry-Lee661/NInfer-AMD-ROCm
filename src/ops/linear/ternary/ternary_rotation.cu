@@ -106,6 +106,27 @@ void launch_ternary_rotation_quantized(const Tensor& x, std::int32_t k, TernaryS
         throw std::invalid_argument("ternary rotation (fused quant): sign row count does not match K");
     }
 
+    // T4(2026-10-16, M3-1): rmsnorm+rotquant 融合。arm 命中 = 激活从未归一(norm 节点被执行层
+    // 跳过, 登记见 ternary_rotation.h), 融合核一并做 norm+旋转+量化写 scratch, h 不被读写。
+    // arm 的跳过安全性由消费投影层的 ternary_rmsnorm_rotq_guard 保证: 不可纳 dp4a 的消费权重
+    // 会在到达这里之前补做 norm 并 disarm, 所以命中即意味着本调用属于 dp4a 延迟路径。
+    if (const RmsnormRotqArm* arm = rmsnorm_rotq_arm_state();
+        arm != nullptr && arm->expect_x == x.data) {
+        const std::int32_t tokens = x.ne[1];
+        if (k != arm->k || scratch.rot_signs == nullptr) {
+            throw std::invalid_argument(
+                "ternary rmsnorm+rotq arm: activation/k mismatch or missing deferred geometry");
+        }
+        ternary_rmsnorm_rotate_quant_q8_kernel<<<tokens, 640, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(arm->raw_x->data),
+            static_cast<const __nv_bfloat16*>(arm->norm_w->data), arm->eps, scratch.dp4a_xq,
+            scratch.dp4a_ds8, scratch.rot_signs, scratch.rot_n_blk, k, tokens,
+            scratch.rot_perm_hd, scratch.rot_perm_nk, scratch.rot_perm_rep);
+        CUDA_CHECK(cudaGetLastError());
+        ternary_rmsnorm_rotq_disarm();
+        return;
+    }
+
     // v3 选择器(2026-10-09, M3a): 4 warp 合作一个 1024 块(并行度 ×4)。
     // NINFER_ROTQ_SPLIT=0 回退 v2(同二进制 A/B)。
     static const bool split_v3 = [] {

@@ -125,4 +125,38 @@ void launch_ternary_rotation_inverse_inplace(Tensor& data, const Weight& weight,
                                                 WorkspaceArena& workspace, cudaStream_t stream,
                                                 TernaryS8Scratch& scratch);
 
+// T4(2026-10-16, M3-1): rmsnorm + rotquant 融合的接线面(arm 机制, 与 QHOIST 静态窗口同族)。
+//
+// 分离路径: rmsnorm 节点(execution 层发射) -> bf16 h -> ops wrapper 的 folded_activation_or_defer
+// 决定"旋转 or 延迟" -> dp4a 量化发射点(launch_ternary_rotation_quantized)读 h。
+// 融合路径把 norm 节点并进量化发射点: arm 命中时该发射点改跑
+// ternary_rmsnorm_rotate_quant_q8_kernel(norm 平方和归约 + 旋转 + 量化一核, 直接写
+// scratch.dp4a_xq/dp4a_ds8), h 整个不被读写, 每站点省一个节点(64 层 x 2 个范数原点)。
+//
+// 安全面(为什么 arm 之外还要 guard): arm 只登记 {expect_x, raw_x, norm_w, eps}(执行层看不到
+// 消费权重的形状); "跳过 norm 是否安全"由消费投影在自己的层里裁决 = ternary_rmsnorm_rotq_guard:
+//   消费权重可纳 dp4a 延迟(与 NINFER_ROTQ_FUSE 同一判据) => 无事(下游融合核会接手, h 不被读);
+//   否则 => 立即补做 unit-offset rmsnorm 写回 h 再放行(退化为原两节点路径, 数值等价)。
+// 因此 arm 打错时只会多跑一次 rmsnorm, 永远不会让消费端读到未初始化的 h。
+//
+// 生命周期: 单会话静态(宿主派发与图捕获均单线程, 同 QHOIST 契约); 每个融合站点在自己的消费
+// 调用前 arm 一次, 由融合发射或 guard 回退消费后失效; 图回放不再执行宿主代码。
+struct RmsnormRotqArm {
+    const void* expect_x  = nullptr;   // 消费层将看到的激活地址(= h.data)
+    const Tensor* raw_x   = nullptr;   // arm 之前被跳过 norm 的原始激活
+    const Tensor* norm_w  = nullptr;   // 该 norm 的 unit-offset 权重
+    float eps             = 0.0f;
+    std::int32_t k        = 0;         // 范数行宽(融合核只服务 5120)
+};
+
+// arm 成功返回 true => 调用方跳过 ops::rmsnorm。判定 = NINFER_RMSNORM_ROTQ_FUSE=1(按值解析)
+// && k == 5120 && tokens 在 dp4a 窗口(1..4)。消费权重维度的裁决留给 guard。
+[[nodiscard]] bool ternary_rmsnorm_rotq_arm(const void* expect_x, const Tensor& raw_x,
+                                            const Tensor& norm_weight, float eps, std::int32_t k);
+void ternary_rmsnorm_rotq_disarm();
+[[nodiscard]] const RmsnormRotqArm* rmsnorm_rotq_arm_state();
+
+// 消费守卫(投影所在层调用, 每个可能吃到 arm 激活的消费入口一次): 见上"安全面"。
+void ternary_rmsnorm_rotq_guard(const Tensor& hidden, const Weight& consumer, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

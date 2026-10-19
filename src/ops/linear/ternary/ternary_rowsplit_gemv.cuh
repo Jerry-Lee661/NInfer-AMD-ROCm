@@ -193,8 +193,11 @@ void ternary_pq2_gemv_xlds_kernel(const __nv_bfloat16* __restrict__ x,
     if (lane == 0) { out[warp] = __float2bfloat16_rn(accumulator); }
 }
 
-// T=2..4 verify tile 的 dp4a 版: 权重码字节每组解码一次(v_perm), 每 token 一条 dp4a。
+// T=2..kCols verify tile 的 dp4a 版: 权重码字节每组解码一次(v_perm), 每 token 一条 dp4a。
 // 与 bf16 tile 核同骨架: 权重单次读, 输出 [t * out_row_stride + row]。
+// kCols = 列宽模板(P0b, 2026-10-18: 4→6 放开 rung); 发射点按 tokens 选宽, ≤4 的实例
+// 与旧核逐字同(kCols=4 实例保持原 codegen)。
+template <int kCols>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_pq2_gemv_tile_dp4a_kernel(const std::int8_t* __restrict__ xq,
                                        const std::uint16_t* __restrict__ ds8,
@@ -204,6 +207,7 @@ void ternary_pq2_gemv_tile_dp4a_kernel(const std::int8_t* __restrict__ xq,
                                        std::int32_t groups_per_row, std::int32_t tokens,
                                        std::int32_t out_row_stride,
                                        const __nv_bfloat16* residual = nullptr) {
+    static_assert(kCols >= 1 && kCols <= 8, "tile size must fit the register accumulators");
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp =
         static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);
@@ -214,10 +218,12 @@ void ternary_pq2_gemv_tile_dp4a_kernel(const std::int8_t* __restrict__ xq,
         scales + static_cast<std::int64_t>(warp) * groups_per_row * kGemvScaleBytesPerGroup;
 
     // M2 刀二: 残差 epilogue(同 T=1 核: 先读后写, residual 不带 __restrict__)。
-    float residual_value[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float residual_value[kCols];
+#pragma unroll
+    for (int t = 0; t < kCols; ++t) { residual_value[t] = 0.0f; }
     if (residual != nullptr && lane == 0) {
 #pragma unroll
-        for (int t = 0; t < 4; ++t) {
+        for (int t = 0; t < kCols; ++t) {
             if (t < tokens) {
                 residual_value[t] =
                     __bfloat162float(residual[static_cast<std::int64_t>(t) * out_row_stride + warp]);
@@ -225,9 +231,9 @@ void ternary_pq2_gemv_tile_dp4a_kernel(const std::int8_t* __restrict__ xq,
         }
     }
 
-    float accumulator[4];
+    float accumulator[kCols];
 #pragma unroll
-    for (int t = 0; t < 4; ++t) { accumulator[t] = 0.0f; }
+    for (int t = 0; t < kCols; ++t) { accumulator[t] = 0.0f; }
 
     for (int group = 0; group < groups_per_row; ++group) {
         const std::uint8_t raw = code_row[group * kGemvCodeBytesPerGroup + lane];
@@ -237,7 +243,7 @@ void ternary_pq2_gemv_tile_dp4a_kernel(const std::int8_t* __restrict__ xq,
         const std::int64_t xbase =
             static_cast<std::int64_t>(group) * kGemvGroupK + lane * 4;
 #pragma unroll
-        for (int t = 0; t < 4; ++t) {
+        for (int t = 0; t < kCols; ++t) {
             if (t < tokens) {
                 const int x4 = *reinterpret_cast<const int*>(
                     xq + static_cast<std::int64_t>(t) * groups_per_row * kGemvGroupK + xbase);
@@ -251,7 +257,7 @@ void ternary_pq2_gemv_tile_dp4a_kernel(const std::int8_t* __restrict__ xq,
     }
 
 #pragma unroll
-    for (int t = 0; t < 4; ++t) {
+    for (int t = 0; t < kCols; ++t) {
         float value = accumulator[t];
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -276,7 +282,8 @@ void ternary_pq2_gemv_tile_dp4a_kernel(const std::int8_t* __restrict__ xq,
 //
 // ⚠️ T=1 必须走下面 seg2_t1(专用单累加器 + group unroll-8)而不是这个 tile 结构:
 // 探针实测 tile 结构在 T=1 比专用核慢 2.7-2.9×(7168 行 54.7 vs 20.2µs)——第一版 seg2
-// 因此判负(-9.5%)。tile 结构只服务 T=2..4(每权重字节摊 4 份算术,原设计域)。
+// 因此判负(-9.5%)。tile 结构只服务 T=2..kCols(每权重字节摊 kCols 份算术,原设计域)。
+template <int kCols>
 __global__ __launch_bounds__(kGemvWarpsPerBlock * 32)
 void ternary_pq2_gemv_tile_dp4a_seg2_kernel(const std::int8_t* __restrict__ xq,
                                             const std::uint16_t* __restrict__ ds8,
@@ -287,6 +294,7 @@ void ternary_pq2_gemv_tile_dp4a_seg2_kernel(const std::int8_t* __restrict__ xq,
                                             __nv_bfloat16* __restrict__ out_b,
                                             std::int32_t stride_b, std::int32_t rows,
                                             std::int32_t groups_per_row, std::int32_t tokens) {
+    static_assert(kCols >= 1 && kCols <= 8, "tile size must fit the register accumulators");
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp =
         static_cast<int>(blockIdx.x) * kGemvWarpsPerBlock + (static_cast<int>(threadIdx.x) >> 5);
@@ -296,9 +304,9 @@ void ternary_pq2_gemv_tile_dp4a_seg2_kernel(const std::int8_t* __restrict__ xq,
     const std::uint8_t* scale_row =
         scales + static_cast<std::int64_t>(warp) * groups_per_row * kGemvScaleBytesPerGroup;
 
-    float accumulator[4];
+    float accumulator[kCols];
 #pragma unroll
-    for (int t = 0; t < 4; ++t) { accumulator[t] = 0.0f; }
+    for (int t = 0; t < kCols; ++t) { accumulator[t] = 0.0f; }
 
     for (int group = 0; group < groups_per_row; ++group) {
         const std::uint8_t raw = code_row[group * kGemvCodeBytesPerGroup + lane];
@@ -308,7 +316,7 @@ void ternary_pq2_gemv_tile_dp4a_seg2_kernel(const std::int8_t* __restrict__ xq,
         const std::int64_t xbase =
             static_cast<std::int64_t>(group) * kGemvGroupK + lane * 4;
 #pragma unroll
-        for (int t = 0; t < 4; ++t) {
+        for (int t = 0; t < kCols; ++t) {
             if (t < tokens) {
                 const int x4 = *reinterpret_cast<const int*>(
                     xq + static_cast<std::int64_t>(t) * groups_per_row * kGemvGroupK + xbase);
@@ -326,7 +334,7 @@ void ternary_pq2_gemv_tile_dp4a_seg2_kernel(const std::int8_t* __restrict__ xq,
     __nv_bfloat16* out        = in_a ? out_a : out_b;
     const std::int32_t stride = in_a ? stride_a : stride_b;
 #pragma unroll
-    for (int t = 0; t < 4; ++t) {
+    for (int t = 0; t < kCols; ++t) {
         float value = accumulator[t];
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {

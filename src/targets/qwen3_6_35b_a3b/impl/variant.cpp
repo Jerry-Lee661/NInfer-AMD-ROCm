@@ -137,6 +137,12 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
     ops::linear_add(attention, weight, residual, workspace, stream);
 }
 
+bool Variant::attention_input_chain(const Tensor&, const Tensor&, float,
+                                    const FullAttentionProjectionWeights&, Tensor&, Tensor&,
+                                    Tensor&, Tensor&, Tensor&, WorkspaceArena&, cudaStream_t) {
+    return false; // T5 片 3 未接线(27b 线专用)
+}
+
 void Variant::mtp_attention_projection(const Tensor& hidden,
                                        const MtpAttentionProjectionWeights& weights, Tensor& query,
                                        Tensor& gate, Tensor& key, Tensor& value,
@@ -210,6 +216,12 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     ops::gdn_norm_gating_proj(residual, norm_weight, eps, weights.a_b_projection, weights.a_log,
                               weights.dt_bias, workspace, hidden, g, beta, stream);
+}
+
+bool Variant::gdn_norm_gating_chain(const Tensor&, const Tensor&, float,
+                                    const GdnProjectionWeights&, Tensor&, Tensor&, Tensor&,
+                                    cudaStream_t) {
+    return false; // T5 片 3b 未接线(27b 线专用)
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
@@ -312,6 +324,14 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6
         ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S, first, last),
         ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q6G64_F16S, first,
                                                  last));
+}
+
+std::size_t Variant::output_head_workspace_capacity_bytes(WeightsProfile, std::int32_t first,
+                                                          std::int32_t last) {
+    validate_token_interval(first, last);
+    // The groupwise-int output head is a plain quantized projection with no transient workspace
+    // (this variant carries no folded ternary port).
+    return 0;
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,

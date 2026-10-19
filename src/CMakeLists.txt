@@ -225,6 +225,7 @@ add_library(ninfer_ops STATIC
   ops/linear/ternary/ternary_rotation.cpp
   ops/linear/ternary/ternary_rotation.cu
   ops/linear/ternary/ternary_rowsplit_gemm.cu
+  ops/linear/ternary/ternary_mlp_chain.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu

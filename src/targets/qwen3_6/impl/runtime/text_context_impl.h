@@ -32,6 +32,9 @@
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 
+#include "ops/linear/ternary/ternary_mlp_chain.h"
+#include "ops/linear/ternary/ternary_rotation.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -823,6 +826,60 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
+namespace {
+// T5 片 2b 接线辅助(同 mlp_tail 侧 try_ternary_mlp_chain 的 MOE 编译面处理: 只有密集载荷
+// 带 gate_up/down, 模板上下文里 if constexpr 才丢弃)。MLP 侧权重是常驻权重结构, 跨
+// mixer/mlp 两站可见, 故统一尾链在 mixer 站发射也能取到 MLP 段参数。
+template <class Payload>
+bool try_ternary_tail_chain_attn(const Tensor& gate, Tensor& act, const Weight& o_proj_weight,
+                                 Tensor& x, const Tensor& post_norm, const Payload& payload,
+                                 float eps, WorkspaceArena& workspace, cudaStream_t s) {
+    if constexpr (requires { payload.gate_up; payload.down; }) {
+        return ops::detail::ternary_tail_chain_attn(gate, act, o_proj_weight, x, post_norm,
+                                                    payload.gate_up, payload.down, eps, workspace,
+                                                    s);
+    } else {
+        return false;
+    }
+}
+
+template <class Payload>
+bool try_ternary_tail_chain_gdn(const Tensor& o, const Tensor& norm_weight, const Tensor& z,
+                                Tensor& on, const Weight& o_proj_weight, Tensor& x,
+                                const Tensor& post_norm, const Payload& payload, float eps,
+                                WorkspaceArena& workspace, cudaStream_t s) {
+    if constexpr (requires { payload.gate_up; payload.down; }) {
+        return ops::detail::ternary_tail_chain_gdn(o, norm_weight, z, on, o_proj_weight, x,
+                                                   post_norm, payload.gate_up, payload.down, eps,
+                                                   workspace, s);
+    } else {
+        return false;
+    }
+}
+
+// R1 刀(2026-10-17 剩余节点组): [recurrent 批更新 + 统一尾链] 合成入口(同 MOE 编译面处理)。
+template <class Payload>
+bool try_ternary_tail_chain_gdn_recurrent(const Tensor& q_batch, const Tensor& k_batch,
+                                          const Tensor& v_batch, const Tensor& g_batch,
+                                          const Tensor& beta_batch, float scale,
+                                          const Tensor& recurrent_states,
+                                          const Tensor& source_state_slots,
+                                          const Tensor& destination_state_slots, Tensor& o,
+                                          const Tensor& norm_weight, const Tensor& z, Tensor& on,
+                                          const Weight& o_proj_weight, Tensor& x,
+                                          const Tensor& post_norm, const Payload& payload, float eps,
+                                          WorkspaceArena& workspace, cudaStream_t s) {
+    if constexpr (requires { payload.gate_up; payload.down; }) {
+        return ops::detail::ternary_tail_chain_gdn_recurrent(
+            q_batch, k_batch, v_batch, g_batch, beta_batch, scale, recurrent_states,
+            source_state_slots, destination_state_slots, o, norm_weight, z, on, o_proj_weight, x,
+            post_norm, payload.gate_up, payload.down, eps, workspace, s);
+    } else {
+        return false;
+    }
+}
+} // namespace
+
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -833,7 +890,6 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
-    ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
@@ -843,8 +899,24 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
-                                  s);
+    // T5 片 3(默认开, NINFER_INPUT_CHAIN=0 回退): input_norm + rotq(k=5120) + qkv segn GEMV
+    // 3 节点并成 1 个持久核(ops/linear/ternary/ternary_mlp_chain.cu; gdn 支在 gdn_mix)。
+    // 顺序: 先试 T4 arm(T4 门默认关, arm 成功 = 它接管 norm + 融合量化, 链核必须让路);
+    // arm 未生效时试链核; 未准入再走常规 rmsnorm + Variant::attention_projection 原路径。
+    bool input_chained = false;
+    if (!ops::detail::ternary_rmsnorm_rotq_arm(h.data, x, *w.input_norm, kCfg.rms_eps,
+                                               kCfg.hidden)) {
+        input_chained = Variant::attention_input_chain(x, *w.input_norm, kCfg.rms_eps,
+                                                       *w.projection, q_flat, gate_flat, k_flat,
+                                                       v_flat, h, work_, s);
+        if (!input_chained) {
+            ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
+        }
+    }
+    if (!input_chained) {
+        Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph,
+                                      work_, s);
+    }
     profile.mark(DecodeRegionProfile::kAttnProj, s);
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
@@ -955,10 +1027,29 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                                       *active_causal_attention_envelope_, work_, a, s);
     }
     profile.mark(DecodeRegionProfile::kAttnKernel, s);
+
+    // T5 片 2a(默认开, NINFER_OUTPROJ_CHAIN=0 回退): sigmoid_mul + o_proj 旋转量化 + o_proj
+    // 投影 3 节点并成 1 个持久核(ops/linear/ternary/ternary_mlp_chain.cu 同核双支; gdn 支在
+    // gdn_mix)。数值契约 = 三节点原路径逐字节(md5 门判); 未准入(T!=1/门关/形状或折叠不符)
+    // 返回 false, 走下面的原路径。
+    Tensor a_flat = a.view({kCfg.q_size, T});
+    // T5 片 2b(NINFER_TAIL_CHAIN=1 开启; 默认关留档): [前置段 + MLP 段] 统一尾链一次发射,
+    // 发射成功后置 pending 旗标, 随后的 mlp_tail 站跳过自己的 MLP 链(节点流两站严格相邻)。
+    if (try_ternary_tail_chain_attn(gate_flat, a_flat, *w.o_proj, x, *w.post_attn_norm,
+                                    *w.mlp.payload, kCfg.rms_eps, work_, s)) {
+        profile.mark(DecodeRegionProfile::kAttnSigmoid, s);
+        profile.mark(DecodeRegionProfile::kAttnOutProj, s);
+        return;
+    }
+    if (ops::detail::ternary_out_proj_chain_attn(gate_flat, a_flat, *w.o_proj, x, work_, s)) {
+        profile.mark(DecodeRegionProfile::kAttnSigmoid, s);
+        profile.mark(DecodeRegionProfile::kAttnOutProj, s);
+        return;
+    }
     ops::sigmoid_mul(gate, a, s);
     profile.mark(DecodeRegionProfile::kAttnSigmoid, s);
 
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    Variant::attention_output_projection(a_flat, *w.o_proj, x, ph, work_, s);
     profile.mark(DecodeRegionProfile::kAttnOutProj, s);
 }
 
@@ -972,9 +1063,9 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor g           = control.g;
     Tensor beta        = control.beta;
     profile.mark(DecodeRegionProfile::kGdnCtlStart, s);
-    Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
-                                         work_, s);
-    profile.mark(DecodeRegionProfile::kGdnControl, s);
+    // norm+gating 两支同构(默认开, NINFER_INPUT_CHAIN=0 回退): T5 片 3b 刀一把 [input_norm +
+    // 闸门 GEMV] 2 节点并成 1 个持久核; 未准入(T!=1/门关/形状不符)回落原调用。
+    // 注: decode T=1 走 Phase::Verify 分支(快照支), 所以两处都要挂。
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -982,6 +1073,12 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor kc             = projection.key;
     Tensor vc             = projection.value;
     if (ph == Phase::Verify) {
+        if (!Variant::gdn_norm_gating_chain(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g,
+                                            beta, s)) {
+            Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h,
+                                                 g, beta, work_, s);
+        }
+        profile.mark(DecodeRegionProfile::kGdnControl, s);
         if (active_sequence_batch_ == 0 || active_linear_state_source_slots_ == nullptr) {
             throw std::logic_error(
                 "Verify GDN requires an explicit sequence batch and state slots");
@@ -1017,7 +1114,15 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         }
     } else {
         Tensor qkv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
+        // norm+gating 同 Verify 支(刀一); 投影侧 [rotq(k=5120) + qk|value|z segn GEMV] 的刀二
+        // 挂在 launch_ternary_split 入口(含 prefill 与快照两条调用链), 本支不重复接线。
+        if (!Variant::gdn_norm_gating_chain(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g,
+                                            beta, s)) {
+            Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h,
+                                                 g, beta, work_, s);
+        }
         Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
+        profile.mark(DecodeRegionProfile::kGdnControl, s);
         Tensor conv_state_in =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor conv_state_out =
@@ -1031,6 +1136,10 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
+        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    // on(gated_rmsnorm 输出缓冲)上提到 Verify/prefill 两分支之前: R1 刀的合成入口在同一
+    // 站点同时用到 recurrent 输出 o 与其下游的 on(缓冲本身与分支无关, 只是视图)。
+    Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     if (ph == Phase::Verify) {
         Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
@@ -1052,6 +1161,18 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                                                *active_linear_state_source_slots_, records.key,
                                                records.value, records.gate, out_batch, s);
         } else {
+            // R1 刀(2026-10-17 剩余节点组, NINFER_REC_TAIL_CHAIN=1 开; 默认关): [recurrent
+            // 批更新 + 统一尾链] 两节点并 1(含 MLP 段, 成功后置 pending 由 mlp_tail 消费)。
+            // 未准入逐位回落原 batch_update + 下游尾链路径。
+            if (try_ternary_tail_chain_gdn_recurrent(
+                    q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states,
+                    *active_linear_state_source_slots_, *active_linear_state_destination_slots_,
+                    o, *w.gdn_norm, z, on, *w.out_proj, x, *w.post_attn_norm, *w.mlp.payload,
+                    kCfg.rms_eps, work_, s)) {
+                profile.mark(DecodeRegionProfile::kGdnRecurKernel, s);
+                profile.mark(DecodeRegionProfile::kGdnOutProj, s);
+                return;
+            }
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
                 /*normalize_qk=*/true, recurrent_states, *active_linear_state_source_slots_,
@@ -1069,19 +1190,56 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     profile.mark(DecodeRegionProfile::kGdnRecurKernel, s);
 
-    Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
-        {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    // T5 片 2b(NINFER_TAIL_CHAIN=1 开启; 默认关留档): 统一尾链([gated_rmsnorm+rotq+o_proj]
+    // 前置段 + MLP 段一次发射); 成功后置 pending, mlp_tail 站跳过自己的 MLP 链。
+    if (try_ternary_tail_chain_gdn(o, *w.gdn_norm, z, on, *w.out_proj, x, *w.post_attn_norm,
+                                   *w.mlp.payload, kCfg.rms_eps, work_, s)) {
+        profile.mark(DecodeRegionProfile::kGdnOutProj, s);
+        return;
+    }
+    // T5 片 2a(默认开, NINFER_OUTPROJ_CHAIN=0 回退): gated_rmsnorm + out_proj 旋转量化 +
+    // out_proj 投影 3 节点并成 1 个持久核(同核 gdn 支)。未准入(T!=1/门关/形状不符)走原路径。
+    if (ops::detail::ternary_out_proj_chain_gdn(o, *w.gdn_norm, z, on, *w.out_proj, x,
+                                                kCfg.rms_eps, work_, s)) {
+        profile.mark(DecodeRegionProfile::kGdnOutProj, s);
+        return;
+    }
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
     profile.mark(DecodeRegionProfile::kGdnOutProj, s);
 }
 
+namespace {
+// T5 片 1 接线辅助: 密集 MLP 载荷(DensePostMixerPayload)才有 gate_up/down; MOE target
+// (35b_a3b 的 SparseMoePayload)在编译期整段丢弃(模板上下文里 if constexpr 才生效)。
+template <class Payload>
+bool try_ternary_mlp_chain(const Tensor& x, const Tensor& post_norm, const Payload& payload,
+                           float eps, WorkspaceArena& workspace, cudaStream_t s) {
+    // T5 片 2b: 本层的 MLP 尾若已由 mixer 站的统一尾链接手, 这里消费 pending 并跳过发射
+    // (层身份核对 = post_norm 缓冲地址; 核对不中不会误跳过, 见链 TU 的旗标注释)。
+    if (ops::detail::ternary_mlp_chain_consume_pending(post_norm.data)) { return true; }
+    if constexpr (requires { payload.gate_up; payload.down; }) {
+        return ops::detail::ternary_mlp_chain(x, post_norm, payload.gate_up, payload.down, eps,
+                                              workspace, s);
+    } else {
+        return false;
+    }
+}
+} // namespace
+
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    // T5 片 1(默认开, NINFER_MLP_CHAIN=0 回退): 后范数+gated MLP 整链 6 节点并成 1 个持久核
+    // (ops/linear/ternary/ternary_mlp_chain.cu)。数值契约 = 原路径逐字节(md5 门判);
+    // 未准入(T!=1/非 PQ2 折叠权重/门关)返回 false, 走下面的原路径。
+    if (try_ternary_mlp_chain(x, *post_norm, *m.payload, kCfg.rms_eps, work_, s)) { return; }
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
-    ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
+    // T4(融合接线): 同 attn_mix 的 input_norm 站点; 消费端 = Variant::post_mixer 的 gate_up。
+    if (!ops::detail::ternary_rmsnorm_rotq_arm(h.data, x, *post_norm, kCfg.rms_eps, kCfg.hidden)) {
+        ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
+    }
 
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }

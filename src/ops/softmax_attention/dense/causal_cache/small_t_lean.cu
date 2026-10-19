@@ -254,7 +254,8 @@ using C8F_w = float __attribute__((ext_vector_type(8)));
 // 追加段（写 KV 缓存）整段照抄老核——它是逐元素量化路径，寄存器压力小。
 template <typename Geometry, int TokenTile, bool Masked, typename CacheInput,
           bool Contig8 = false, bool MultiBatch = false, int MultiKey = 1,
-          bool Prefetch = false, bool RedBatch = false, bool QhFused = false>
+          bool Prefetch = false, bool RedBatch = false, bool QhFused = false,
+          bool Pipe4 = false>
 __global__ __launch_bounds__(256, 1) void causal_attention_small_t_simt_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
     std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
@@ -810,7 +811,97 @@ __global__ __launch_bounds__(256, 1) void causal_attention_small_t_simt_kernel(
             // 批内一次 m/l 重放 → V 4 行并行累。探针(tools/probe_attn_redbatch.cu):
             // 256 keys regime C/A=1.48x; 1024 keys 寄存器溢出判负(Vcontrib 4x8 数组),
             // 引擎 split 后单 split 窗口 ≤ kPagedKVPageSize, 落在小窗侧。
-            if constexpr (RedBatch) {
+            // T2(2026-10-18, NINFER_ATTN_PIPE4=1, 默认关留档): 4-key 软件流水 —— 每轮把 4 个
+            // key 的 K/V/scale 载入一次发出(地址互不依赖), 消费段按 key 顺序逐条执行。
+            // 依据(相位计实测): 现逐 key 预取 1 深度盖不住全局延迟, key 环 ~1200cy/key
+            // (≈1 次 DRAM 级延迟/key), 44 块全并发下整 op ≈ 这条环; 4 连发后每 4 key 只
+            // 暴露 1 次延迟。**数值 = 逐 key 路径逐位同**(同一 key 同一次序, 仅载入时刻提前;
+            // 尾夹紧的越界 key 载入但消费段跳过)。
+            if constexpr (Pipe4) {
+                auto load_kv4 = [&](int kb, int2& kk4, int2& vv4, float& ksc4, float& vsc4) {
+                    const int physical_page = pages_s[(kb >> kPagedKVPageShift) - first_page];
+                    const int page_offset   = kb & kPagedKVPageMask;
+                    const std::int64_t base = kv_cache_int8_quant_code_index<Geometry>(
+                        physical_page, kv_head, 0, page_offset);
+                    if (kv_int4 != 0) {
+                        kk4.x = static_cast<int>(
+                            *reinterpret_cast<const std::uint32_t*>(cache_k_i8 + base + 4 * lane));
+                        vv4.x = static_cast<int>(
+                            *reinterpret_cast<const std::uint32_t*>(cache_v_i8 + base + 4 * lane));
+                        kk4.y = 0;
+                        vv4.y = 0;
+                    } else {
+                        kk4 = load_vec<int2>(cache_k_i8 + base + 8 * lane);
+                        vv4 = load_vec<int2>(cache_v_i8 + base + 8 * lane);
+                    }
+                    ksc4 = __half2float(cache_k_scale[kv_cache_int8_quant_scale_index<Geometry>(
+                        physical_page, kv_head, lane >> 3, page_offset)]);
+                    vsc4 = __half2float(cache_v_scale[kv_cache_int8_quant_scale_index<Geometry>(
+                        physical_page, kv_head, lane >> 3, page_offset)]);
+                };
+                constexpr int kPipe = 4;
+                for (int key = split_start; key < split_end; key += kPipe) {
+                    if (key > qabs) { break; }
+                    int2 kk4[kPipe];
+                    int2 vv4[kPipe];
+                    float ksc4[kPipe];
+                    float vsc4[kPipe];
+#pragma unroll
+                    for (int b = 0; b < kPipe; ++b) {
+                        const int kb = (key + b < split_end) ? (key + b) : (split_end - 1);
+                        load_kv4(kb, kk4[b], vv4[b], ksc4[b], vsc4[b]);
+                    }
+#pragma unroll
+                    for (int b = 0; b < kPipe; ++b) {
+                        if (key + b >= split_end || key + b > qabs) { break; }
+                        float partial = 0.0f;
+                        if (kv_int4 != 0) {
+                            float kd[8];
+                            kv_cache_int4_dequant_u32x8(static_cast<std::uint32_t>(kk4[b].x),
+                                                        ksc4[b], kd);
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) { partial = fmaf(qv[i], kd[i], partial); }
+                        } else {
+                            const std::int8_t* kc = reinterpret_cast<const std::int8_t*>(&kk4[b]);
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) {
+                                partial = fmaf(qv[i], static_cast<float>(kc[i]) * ksc4[b], partial);
+                            }
+                        }
+                        const float sc_batch = warp_sum<32>(partial, FullMask) * scale;
+                        float vmax_sum[8];
+#pragma unroll
+                        for (int r = 0; r < 8; ++r) { vmax_sum[r] = 0.0f; }
+                        const int live = 1;
+                        if (kv_int4 != 0) {
+                            float vd[8];
+                            kv_cache_int4_dequant_u32x8(static_cast<std::uint32_t>(vv4[b].x),
+                                                        vsc4[b], vd);
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) { vmax_sum[i] += vd[i]; }
+                        } else {
+                            const std::int8_t* vc = reinterpret_cast<const std::int8_t*>(&vv4[b]);
+#pragma unroll
+                            for (int i = 0; i < 8; ++i) {
+                                vmax_sum[i] =
+                                    fmaf(static_cast<float>(vc[i]) * vsc4[b], 1.0f, vmax_sum[i]);
+                            }
+                        }
+                        const float nm = fmaxf(m, sc_batch);
+                        const float a =
+                            (m == -CUDART_INF_F) ? 0.0f : exp2_approx((m - nm) * Log2E);
+                        const float pb = exp2_approx((sc_batch - nm) * Log2E);
+#pragma unroll
+                        for (int r = 0; r < 8; ++r) { acc[r] *= a; }
+                        l = l * a + pb * live;
+                        m = nm;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            acc[i] = fmaf(pb / live, vmax_sum[i], acc[i]);
+                        }
+                    }
+                }
+            } else if constexpr (RedBatch) {
                 for (int key = split_start; key < split_end; key += 4) {
                     float partials[4] = {0, 0, 0, 0};
                     float vcontrib[4][8];
@@ -1277,12 +1368,17 @@ void launch_simt_partial(const Tensor& q, CausalAppendInput input, const Tensor&
                          std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                          Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-    // 连续 8 维布局实验（NINFER_ATTN_CONTIG8=1）：K/V 行 64 位加载替代 8 条标量加载。
-    // 归约输入重排 → mtp3 输出与基线良性分岔，走 lean 协议判据。默认关。
+    // 连续 8 维布局(NINFER_ATTN_CONTIG8,**默认开, 仅 TokenTile==1**; =0 回退全关):
+    // 每 lane 持 8 个连续维(= 一个 int8 量化组)→ K/V 行一条 64 位加载替代 8 条标量加载,
+    // scale 退化为每 lane 常量; 值恒等(同 hadamard 变换/同组 scale), 仅归约分组变化(~1ulp)。
+    // T7c 旋钮重扫实测: T=1 nospec +7.2%(60.6→65.0), 三 prompt 关键词保真全过 + 两跑 md5 同;
+    // **T≥2 保持关**: C8 全局时 d2 验收 1.82→1.70(目标侧(verify T=3)数值漂移与 MTP draft
+    // 去相关) ⇒ 限 T=1(decode)后 d2/serve-mtp2 数值逐位不变, 主门口径零扰动。
     static const bool contig8_env = [] {
         const char* value = std::getenv("NINFER_ATTN_CONTIG8");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr ? true : std::atoi(value) != 0;
     }();
+    const bool contig8_eff = (TokenTile == 1) && contig8_env;
     // MultiKey 批量点积(09-30 立项):NINFER_ATTN_MULTIKEY=批宽。
     // 2026-10-09 int8 路径首测(09-30 的中性判定在旧 bf16 路径):MK4(强制 Contig8 布局)
     // decode +7.4%(46.72→50.18,512 长跑 50.19 持平连贯),但 MTP 验收率系统性受损
@@ -1294,8 +1390,10 @@ void launch_simt_partial(const Tensor& q, CausalAppendInput input, const Tensor&
         return value == nullptr ? 1 : std::atoi(value);
     }();
     const int multikey_eff = (TokenTile == 1) ? multikey_env : 1;
-    // 手动预取双缓冲(10-01 微基准 mode2 +26% K/V 流):NINFER_ATTN_PREFETCH=1,
-    // 仅在 Contig8 布局 + MultiKey=1 路径生效。默认关。
+    // 手动预取双缓冲(10-01 微基准 mode2 +26% K/V 流):NINFER_ATTN_PREFETCH,
+    // 仅在 Contig8 布局 + MultiKey=1 路径生效。
+    // T4 翻默认(2026-10-18): 现 build 复测 +1.18%(10 对交错中位, prefill 对照 1.0018,
+    // 两臂 md5 逐字节 6274d7b0)⇒ 默认开, `=0` 回退 base 核。
     // NINFER_KV_INT4=1:K/V 页按 int4 打包(值域 [-8,7],页布局不变)。默认关。
     // 注意:append/prompt_i8/small_t_i8 全部读侧接齐前严禁开启。
     static const std::int32_t kv_int4_env = [] {
@@ -1308,6 +1406,15 @@ void launch_simt_partial(const Tensor& q, CausalAppendInput input, const Tensor&
     }();
     static const bool prefetch_env = [] {
         const char* value = std::getenv("NINFER_ATTN_PREFETCH");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+    // COMBOPF(2026-10-04 补盲区): prefetch 双缓冲 + K4/MK4 批路径的组合, 默认关。
+    // 2026-10-17 门审计: 该组合分支此前直接以 prefetch_env 为条件, 把 PREFETCH=1 单独
+    // 全部劫持到 MultiKey=4 路径(MK4, 有损近似), 真正的逐 key 预取核(<..., 1, true>,
+    // 下方内层 else)运行时不可达。现改为 COMBOPF 显式门: PREFETCH=1 单独走真预取核,
+    // 组合路径仅在两者同开时进入。
+    static const bool combopf_env = [] {
+        const char* value = std::getenv("NINFER_ATTN_COMBOPF");
         return value != nullptr && std::atoi(value) != 0;
     }();
     // RedBatch(2026-10-04 P-C7): 归约批化结构, 默认关, 与 Prefetch/MultiKey 正交。
@@ -1324,6 +1431,17 @@ void launch_simt_partial(const Tensor& q, CausalAppendInput input, const Tensor&
     static const bool qhfused_env = [] {
         const char* value = std::getenv("NINFER_ATTN_QHFUSED");
         return value != nullptr && std::atoi(value) != 0;
+    }();
+    // T2(2026-10-18): 4-key 软件流水 —— 实测 key 环 ~1200-2500cy/key(≈1 次全局延迟/key,
+    // 1 深度预取盖不住), 4 连发载入 + 延迟消费把每 key 暴露延迟降到约 1/4。
+    // 数值与逐 key 路径逐位同(同一 key 同一次序, 仅载入时刻提前)。
+    // T2 翻默认(2026-10-18): 10 对交错中位 +0.75%(10/10 同号, prefill 对照 0.9993),
+    // 数值全门逐位同(md5 10/10, PPL 5.793462, d2 acc 1.81), 相位计 keys+tail 1.50×;
+    // 证据 = bench/evidence/m4t2-attn-keyloop-2026-10-18.md。`=0` 回退逐 key 预取路径
+    // (短窗 5 keys/split 时 4-key 批略贵: 13.18 vs 12.55µs, 折 0.07%/步, 可忽略)。
+    static const bool pipe4_env = [] {
+        const char* value = std::getenv("NINFER_ATTN_PIPE4");
+        return value == nullptr || std::atoi(value) != 0;
     }();
     const auto launch = [&]<bool MultiBatch>() {
         if (qhfused_env) {
@@ -1366,7 +1484,7 @@ void launch_simt_partial(const Tensor& q, CausalAppendInput input, const Tensor&
                     cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                     logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data), kv_int4_env, kv_int4_env, wmma_env);
-        } else if (contig8_env || multikey_eff > 1) {
+        } else if (contig8_eff || multikey_eff > 1) {
             const int mk = multikey_eff > 1 ? multikey_eff : 1;
             if (mk >= 4) {
                 causal_attention_small_t_simt_kernel<Geometry, TokenTile, Masked,
@@ -1388,8 +1506,11 @@ void launch_simt_partial(const Tensor& q, CausalAppendInput input, const Tensor&
                         cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                         logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data), kv_int4_env, kv_int4_env, wmma_env);
-            } else if (prefetch_env) {
+            } else if (combopf_env && prefetch_env) {
                 // Prefetch 双缓冲在 UNROLL4(K4)批路径的组合(2026-10-04 补盲区):
+                // 2026-10-17 门审计: 此前条件只有 prefetch_env, PREFETCH=1 单独会被全部
+                // 劫持到 MultiKey=4(MK4 有损近似), 真预取核(下方内层 else 的 <..., 1, true>)
+                // 运行时不可达。改为 COMBOPF 显式门(默认关): PREFETCH=1 单独走真预取核。
                 // K4 自身已把 4 组 K/V 载入摊进迭代, 双缓冲预取与其正交(下一批 K/V)。
                 // 注: prefetch 块按 MultiKey==1 写的(load_kv lambda + live 语义),
                 // K4 批路径的 live_keys 动态性使逐句移植不平凡 —— 该组合经
@@ -1415,7 +1536,27 @@ void launch_simt_partial(const Tensor& q, CausalAppendInput input, const Tensor&
                         logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data), kv_int4_env, kv_int4_env, wmma_env);
             } else {
-            if (prefetch_env) {
+            if (pipe4_env && prefetch_env) {
+            causal_attention_small_t_simt_kernel<Geometry, TokenTile, Masked, CausalAppendInput,
+                                                 true, MultiBatch, 1, true, false, false, true>
+                <<<grid, 256, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data), input,
+                    static_cast<const std::int32_t*>(pos.data),
+                    static_cast<std::int8_t*>(cache.k_pages.data),
+                    static_cast<std::int8_t*>(cache.v_pages.data),
+                    static_cast<__half*>(cache.k_scale_pages.data),
+                    static_cast<__half*>(cache.v_scale_pages.data),
+                    static_cast<const std::int32_t*>(cache.block_tables.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.table_rows == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                    cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+                    logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data), kv_int4_env, kv_int4_env, wmma_env);
+            } else if (prefetch_env) {
             causal_attention_small_t_simt_kernel<Geometry, TokenTile, Masked, CausalAppendInput,
                                                  true, MultiBatch, 1, true>
                 <<<grid, 256, 0, stream>>>(
@@ -1586,19 +1727,32 @@ void causal_attention_small_t_simt_launch(
             }
         }
     }
+    // t7b 审计缺口修复(2026-10-18): SKIP_PARTIAL/SKIP_REDUCE 此前只挂在旧 small_t launch,
+    // 默认 decode 路由走 simt launch ⇒ 两门运行时死。现接到本路径(语义 = 只跳发射,
+    // 只看计时不看输出, 与 ATTN_SKIP 同协议; A/B 前用 GRAPH_NODES 查节点差分作守卫)。
+    static const bool skip_partial = std::getenv("NINFER_ATTN_SKIP_PARTIAL") != nullptr;
+    static const bool skip_reduce = std::getenv("NINFER_ATTN_SKIP_REDUCE") != nullptr;
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        launch_simt_partial_by_width<CausalD256H24Kv4>(q, input, pos, scale, cache, invocation,
-                                                       logical_capacity, splits, partial_acc,
-                                                       partial_m, partial_l, stream);
-        launch_lean_reduce<CausalD256H24Kv4>(pos, cache, invocation, splits, partial_acc, partial_m,
-                                             partial_l, out, stream);
+        if (!skip_partial) {
+            launch_simt_partial_by_width<CausalD256H24Kv4>(q, input, pos, scale, cache, invocation,
+                                                           logical_capacity, splits, partial_acc,
+                                                           partial_m, partial_l, stream);
+        }
+        if (!skip_reduce) {
+            launch_lean_reduce<CausalD256H24Kv4>(pos, cache, invocation, splits, partial_acc,
+                                                 partial_m, partial_l, out, stream);
+        }
         return;
     }
-    launch_simt_partial_by_width<CausalD256H16Kv2>(q, input, pos, scale, cache, invocation,
-                                                   logical_capacity, splits, partial_acc, partial_m,
-                                                   partial_l, stream);
-    launch_lean_reduce<CausalD256H16Kv2>(pos, cache, invocation, splits, partial_acc, partial_m,
-                                         partial_l, out, stream);
+    if (!skip_partial) {
+        launch_simt_partial_by_width<CausalD256H16Kv2>(q, input, pos, scale, cache, invocation,
+                                                       logical_capacity, splits, partial_acc,
+                                                       partial_m, partial_l, stream);
+    }
+    if (!skip_reduce) {
+        launch_lean_reduce<CausalD256H16Kv2>(pos, cache, invocation, splits, partial_acc, partial_m,
+                                             partial_l, out, stream);
+    }
 }
 
 } // namespace ninfer::ops::detail

@@ -36,7 +36,7 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
         }
     };
 
-    include_tier(4096, 64 / Geometry::SmallTSplitScale);
+    include_tier(4096, kSmallTDecodeKeysPerSplit / Geometry::SmallTSplitScale);
     if (window > 4096) { include_tier(8198, 128 / Geometry::SmallTSplitScale); }
     if (window > 8198) { include_tier(16390, 256 / Geometry::SmallTSplitScale); }
     if (window > 16390) { include_tier(window, 480 / Geometry::SmallTSplitScale); }

@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -23,6 +24,19 @@ void log_cuda_error(const char* op, cudaError_t err) noexcept {
 }
 
 bool is_power_of_two(std::size_t value) { return value != 0 && (value & (value - 1)) == 0; }
+
+// T1 诊断(2026-10-09,M3-0):所有 DeviceArena 构造点打身份(地址+容量+own/borrowed 标签)。
+// NINFER_ARENA_TRACE 非空才输出(值解析,默认关);溢出 throw 里也带 base,两处匹配即可
+// 点名溢出 arena 的构造来源。
+bool arena_trace_enabled() {
+    return std::getenv("NINFER_ARENA_TRACE") != nullptr;
+}
+
+void trace_arena_ctor(const char* tag, const void* base, std::size_t cap) {
+    if (!arena_trace_enabled()) { return; }
+    std::fprintf(stderr, "[arena-trace] %s base=%p cap=%zu\n", tag, base, cap);
+    std::fflush(stderr);
+}
 
 std::uintptr_t checked_add_uintptr(std::uintptr_t a, std::size_t b) {
     if (b > std::numeric_limits<std::uintptr_t>::max() - a) {
@@ -145,6 +159,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     base_ = ptr;
     cap_  = capacity_bytes;
     off_  = 0;
+    trace_arena_ctor("owning", base_, cap_);
 }
 
 DeviceArena::DeviceArena(DeviceSpan storage)
@@ -152,6 +167,7 @@ DeviceArena::DeviceArena(DeviceSpan storage)
     if (base_ == nullptr || cap_ == 0) {
         throw std::invalid_argument("borrowed DeviceArena storage must be non-empty");
     }
+    trace_arena_ctor("borrowed", base_, cap_);
 }
 
 DeviceArena::~DeviceArena() {
@@ -208,9 +224,16 @@ DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
     if (end > cap_) {
         // 带出实数: bad_alloc 无从定位(2026-10-03 cut3 的 wrapper 叶池越界排查花在盲猜上),
         // 三个数(need/off/cap)直接给到越界者与亏空大小。
+        if (arena_trace_enabled()) {
+            std::fprintf(stderr, "[arena-trace] overflow on base=%p cap=%zu (owning=%d)",
+                         base_, cap_, owns_ ? 1 : 0);
+            std::fprintf(stderr, " peak=%zu used=%zu\n", peak_, off_);
+            std::fflush(stderr);
+        }
         throw std::runtime_error("DeviceArena overflow: need " + std::to_string(end) +
                                  " B (off " + std::to_string(aligned_offset) + " + " +
-                                 std::to_string(bytes) + " B), cap " + std::to_string(cap_) + " B");
+                                 std::to_string(bytes) + " B), cap " + std::to_string(cap_) +
+                                 " B, base=" + std::to_string(reinterpret_cast<std::uintptr_t>(base_)));
     }
 
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;

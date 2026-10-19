@@ -1,5 +1,7 @@
 # NInfer-AMD-ROCm
 
+> **Development status: indefinitely paused (2026-10-19).** The port has been wrapped up and this repository is frozen at the final snapshot. No further builds, tests, or tuning will be performed. The tree includes work completed after the v0.1.0 release (M3/M4 rounds: INT8 KV routing, iu8 WMMA verify tiles, graph node fusion); the headline figures below are the v0.1.0 release numbers and are not updated for later commits.
+
 A research port of the [NInfer](https://github.com/Neroued/ninfer) single-GPU inference engine to **AMD gfx1100 (Radeon RX 7900 XTX / XT, RDNA 3)** on Linux + ROCm.
 
 The tree is based on [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) v0.6.1 (itself a community retarget of the upstream RTX 5090 engine to sm_86). The port keeps CUDA sources untouched and bridges them with a `compat/cuda` HIP shim, so the diff against the base fork stays reviewable and rebaseable.

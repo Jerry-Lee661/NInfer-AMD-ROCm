@@ -57,11 +57,15 @@ inline constexpr int kTernaryS8MinTokens = 33;
 struct TernaryS8Scratch {
     std::int8_t* codes  = nullptr;
     float*       scales = nullptr;
-    // PQ2_0 decode GEMV 的 dp4a 配方 scratch(NINFER_PQ2_DP4A=1, T=1 专用):
+    // PQ2_0 decode GEMV 的 dp4a 配方 scratch(NINFER_PQ2_DP4A=1, T=1..kPq2Dp4aMaxTokens):
     // q8_1 预量化激活(int8 码 + 每 32 元素 fp16 scale), PrismML mmvq 同款。
     // 空指针 = 该 rung 不可用, launch 保持 bf16 arm。
     std::int8_t*   dp4a_xq  = nullptr;
     std::uint16_t* dp4a_ds8 = nullptr;
+    // iu8 verify tile 的 split-K 部分和 scratch(NINFER_PQ2_IU8_KS=2|4, 默认关)。布局
+    // [ks][t][row] f32; 只有行数 ≤ kPq2Iu8KsRows 的站点在 warp 饥饿区兑现(探针 K16)。
+    // 空指针 = 走单发 tile 核(现状)。容量 = ternary_pq2_iu8_ksplit_bytes(tokens)。
+    float* dp4a_ksplit = nullptr;
     // 旋转延迟(M2, megakernel): 非空 = 传下来的激活是"未旋转"的, dp4a_xq 必须由融合核
     // (rotate+quant 合一)就地生成, 而不是读已旋转的 bf16 缓冲。由
     // folded_activation_or_defer() 判定并填写, 随 scratch 值传递(无全局窗口, 图捕获安全);
@@ -82,8 +86,16 @@ inline constexpr std::size_t ternary_s8_scales_bytes(std::int32_t tokens) {
     return static_cast<std::size_t>(tokens) * sizeof(float);
 }
 
-// dp4a rung 的 scratch 字节数。tokens 参数留给未来的 verify-tile 刀; 当前 rung 只服务
-// T=1, 分配端与 workspace 容量端都按 tokens=1 计(ternary_rotation_workspace_bytes)。
+// dp4a/iu8 verify rung 的 token 上限(单一事实源): 准入(ternary_pq2_dp4a_admits /
+// folded_dp4a_admits / dispatch 三处)、scratch 分配与容量公式(ternary_rotation_workspace_bytes
+// 的 dp4a 片 + gdn wrapper 叶池补丁)全部引用本常量, 不许各处再写字面量。
+// 2026-10-18(P0b): 4→6 —— d5(T=6)的 verify 宽度接进快路(此前 >4 掉 bf16 small_t, 2.0×)。
+// iu8 核按 16 列片段构造(探针 K3 至 T8 已验); dp4a tile 核按本常量模板化取宽。
+// 数值门: T≤4 路径逐位不变(d2 锚 3857bdb9), T=5/6 按 S1 流程(d5/d3 对拍 + PPL)。
+inline constexpr std::int32_t kPq2Dp4aMaxTokens = 6;
+
+// dp4a rung 的 scratch 字节数。分配端按实际 tokens, 容量端(ternary_rotation_workspace_bytes)
+// 按 kPq2Dp4aMaxTokens 计。
 inline constexpr std::size_t ternary_pq2_dp4a_xq_bytes(std::int32_t k, std::int32_t tokens) {
     return static_cast<std::size_t>(k) * static_cast<std::size_t>(tokens);
 }
@@ -91,6 +103,25 @@ inline constexpr std::size_t ternary_pq2_dp4a_xq_bytes(std::int32_t k, std::int3
 inline constexpr std::size_t ternary_pq2_dp4a_ds8_bytes(std::int32_t k, std::int32_t tokens) {
     return static_cast<std::size_t>(k / 32) * sizeof(std::uint16_t) *
            static_cast<std::size_t>(tokens);
+}
+
+// iu8 verify tile split-K 的形状边界与 scratch 字节数(M4-T1d, 2026-10-18)。
+// 形状定律(探针 K14/K16): split-K 只在 warp 饥饿区兑现 —— 小行数 1.37-1.64×, 16384 行
+// 中性(0.96-1.08) ⇒ 接线按行数条件: rows ≤ kPq2Iu8KsRows 才切, 其余走单发。
+// kSplit(2|4)为编译期模板宽; 部分和布局 [ks][t][row] f32, 行步长 = rows。
+inline constexpr std::int32_t kPq2Iu8KsRows = 8192;
+inline constexpr std::int32_t kPq2Iu8KsMaxSplit = 4;
+
+// scratch 字节数。固定按区域上界 kPq2Iu8KsRows 计(不按各事务实际 rows —— 容量口径
+// 跨 8 个调用点且 row 语义不一, 固定上界可证充分: 切分仅当 rows ≤ 上界时发生),
+// tokens 上夹到 rung 上限(< 2 或上夹后 < 2 时 = 0: T=1 走 GEMV 不切)。
+// 容量端按计划的 max_tokens 查询(可 > 6, 上夹保证 ≥ 实际派发的 6-token 片);
+// 分配端按实际 tokens 调用。
+inline constexpr std::size_t ternary_pq2_iu8_ksplit_bytes(std::int32_t tokens) {
+    const std::int32_t t = tokens > kPq2Dp4aMaxTokens ? kPq2Dp4aMaxTokens : tokens;
+    return t >= 2 ? static_cast<std::size_t>(kPq2Iu8KsRows) * kPq2Iu8KsMaxSplit * 4u *
+                        static_cast<std::size_t>(t) + 256u
+                  : 0u;
 }
 
 // A/B 门(2026-10-03 默认开): dp4a 配方(T=1..4 PQ2 decode)覆盖收口 + 数值门绿

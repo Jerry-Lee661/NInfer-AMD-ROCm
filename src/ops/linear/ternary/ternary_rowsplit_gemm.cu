@@ -8,6 +8,7 @@
 #include "ops/linear/ternary/ternary_rowsplit_mma_s8.cuh"
 #include "ops/linear/ternary/ternary_rowsplit_mma_small_t.cuh"
 #include "ops/linear/ternary/ternary_rowsplit_mma_wide_t.cuh"
+#include "ops/linear/ternary/ternary_pq2_iu8_wmma.cuh"
 #include "ops/linear/ternary/ternary_t2v2.cuh"
 
 #include <cstdint>
@@ -412,6 +413,16 @@ void ternary_pq2_dp4a_hoist_end() {
     g_dp4a_hoist_tokens = 0;
 }
 
+// S1/S1b(2026-10-17, verify 摊销手术): iu8-WMMA verify tile 域开关(dp4a tile 与 seg2 两处
+// 共用同一门)。默认开, `=0` 回退 dp4a(opt-out 语义与四链一致)。
+bool pq2_iu8_enabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("NINFER_PQ2_IU8");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 // dp4a rung 的统一入口(T=1..4, PQ2_0, NINFER_PQ2_DP4A=1): 量化 pass(按 token 行)
 // + gemv/tile dp4a 内核。调用方保证 scratch.dp4a_xq 非空(门开时由
 // allocate_ternary_s8_scratch / ternary_dispatch 分配)与 PQ2 整组 K; 这里只做形状分发。
@@ -419,6 +430,12 @@ void launch_pq2_dp4a_tile(const Tensor& x, const Weight& w, Tensor& out,
                           std::int32_t out_row_stride, cudaStream_t stream,
                           TernaryS8Scratch scratch, const Tensor* residual) {
 #if defined(NINFER_HIP)
+    // S1(2026-10-17, verify 摊销手术): verify tile(T=2..4)换 iu8-WMMA 核
+    // (ternary_pq2_iu8_wmma.cuh)。同一 xq/ds8/权重字节流, 只换 GEMM 核: 16 行解码摊 16 列,
+    // 指令流不再随列线性放大。探针实测对 dp4a tile 全形状 ≥2.0×(T=3 2.00-2.16×)。
+    // 全门绿后**默认开**(2026-10-17): d2 27.3→39.0(+42%, 验收 1.81 同, md5 3857bdb9 逐字节同),
+    // d1 +25%, serve headline 24.2→34.7(+43%)/服务端 25.6→37.5, PPL 1.75673 逐位同。
+    const bool iu8_enabled = pq2_iu8_enabled();
     const __nv_bfloat16* residual_ptr =
         residual != nullptr ? static_cast<const __nv_bfloat16*>(residual->data) : nullptr;
     const std::int32_t tokens           = x.ne[1];
@@ -438,6 +455,15 @@ void launch_pq2_dp4a_tile(const Tensor& x, const Weight& w, Tensor& out,
                 static_cast<const __nv_bfloat16*>(x.data), scratch.dp4a_xq, scratch.dp4a_ds8, w.k);
         }
     }
+    if (iu8_enabled && tokens >= 2 && (w.n % 16) == 0) {
+        launch_pq2_iu8_wmma_tile(scratch.dp4a_xq, scratch.dp4a_ds8,
+                                 static_cast<const std::uint8_t*>(w.qdata),
+                                 static_cast<const std::uint8_t*>(w.scales),
+                                 static_cast<__nv_bfloat16*>(out.data), w.n, groups_per_row,
+                                 tokens, out_row_stride, stream, residual_ptr,
+                                 scratch.dp4a_ksplit);
+        return;
+    }
     const unsigned grid = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
     const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
     if (tokens <= 1) {
@@ -445,8 +471,14 @@ void launch_pq2_dp4a_tile(const Tensor& x, const Weight& w, Tensor& out,
             scratch.dp4a_xq, scratch.dp4a_ds8, static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
             w.n, groups_per_row, residual_ptr);
+    } else if (tokens <= 4) {
+        // 4 列实例 = P0b 前的唯一实例, codegen 与旧核逐字同。
+        ternary_pq2_gemv_tile_dp4a_kernel<4><<<grid, block, 0, stream>>>(
+            scratch.dp4a_xq, scratch.dp4a_ds8, static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+            w.n, groups_per_row, tokens, out_row_stride, residual_ptr);
     } else {
-        ternary_pq2_gemv_tile_dp4a_kernel<<<grid, block, 0, stream>>>(
+        ternary_pq2_gemv_tile_dp4a_kernel<kPq2Dp4aMaxTokens><<<grid, block, 0, stream>>>(
             scratch.dp4a_xq, scratch.dp4a_ds8, static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
             w.n, groups_per_row, tokens, out_row_stride, residual_ptr);
@@ -465,6 +497,7 @@ void launch_pq2_dp4a_seg2(const Tensor& x, const Weight& w, Tensor& out_a, std::
                           cudaStream_t stream, TernaryS8Scratch scratch) {
 #if defined(NINFER_HIP)
     const std::int32_t tokens         = x.ne[1];
+    const std::int32_t rows_b         = w.n - rows_a;
     const std::int32_t groups_per_row = w.k / 128;
     const unsigned     qgrid          = static_cast<unsigned>(div_up(w.k / 32, 256));
     const dim3         qgrid3(qgrid, static_cast<unsigned>(tokens), 1u);
@@ -479,6 +512,23 @@ void launch_pq2_dp4a_seg2(const Tensor& x, const Weight& w, Tensor& out_a, std::
         }
         CUDA_CHECK(cudaGetLastError());
     }
+    // S1b(2026-10-17): seg2 的 iu8 分支 —— 同一量化 scratch, 两段各一发 iu8 tile
+    // (段 B 基址 = codes/scales + rows_a 行偏移; 段长任意, 核内 clamp/guard 兜界)。
+    // T=1 仍走合并 dp4a 专用形态(launch 合并的意义在 T=1)。
+    if (pq2_iu8_enabled() && tokens >= 2) {
+        const std::uint8_t* codes  = static_cast<const std::uint8_t*>(w.qdata);
+        const std::uint8_t* scales = static_cast<const std::uint8_t*>(w.scales);
+        launch_pq2_iu8_wmma_tile(scratch.dp4a_xq, scratch.dp4a_ds8, codes, scales,
+                                 static_cast<__nv_bfloat16*>(out_a.data), rows_a, groups_per_row,
+                                 tokens, stride_a, stream, nullptr, scratch.dp4a_ksplit);
+        launch_pq2_iu8_wmma_tile(
+            scratch.dp4a_xq, scratch.dp4a_ds8,
+            codes + static_cast<std::int64_t>(rows_a) * groups_per_row * kGemvCodeBytesPerGroup,
+            scales + static_cast<std::int64_t>(rows_a) * groups_per_row * kGemvScaleBytesPerGroup,
+            static_cast<__nv_bfloat16*>(out_b.data), rows_b, groups_per_row, tokens, stride_b,
+            stream, nullptr, scratch.dp4a_ksplit);
+        return;
+    }
     const unsigned grid = static_cast<unsigned>(div_up(w.n, kGemvWarpsPerBlock));
     const dim3 block(kGemvWarpsPerBlock * 32, 1u, 1u);
     if (tokens <= 1) {
@@ -488,8 +538,15 @@ void launch_pq2_dp4a_seg2(const Tensor& x, const Weight& w, Tensor& out_a, std::
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out_a.data),
             rows_a, stride_a, static_cast<__nv_bfloat16*>(out_b.data), stride_b, w.n,
             groups_per_row);
+    } else if (tokens <= 4) {
+        // 4 列实例 = P0b 前的唯一实例, codegen 与旧核逐字同。
+        ternary_pq2_gemv_tile_dp4a_seg2_kernel<4><<<grid, block, 0, stream>>>(
+            scratch.dp4a_xq, scratch.dp4a_ds8, static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out_a.data),
+            rows_a, stride_a, static_cast<__nv_bfloat16*>(out_b.data), stride_b, w.n,
+            groups_per_row, tokens);
     } else {
-        ternary_pq2_gemv_tile_dp4a_seg2_kernel<<<grid, block, 0, stream>>>(
+        ternary_pq2_gemv_tile_dp4a_seg2_kernel<kPq2Dp4aMaxTokens><<<grid, block, 0, stream>>>(
             scratch.dp4a_xq, scratch.dp4a_ds8, static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out_a.data),
             rows_a, stride_a, static_cast<__nv_bfloat16*>(out_b.data), stride_b, w.n,

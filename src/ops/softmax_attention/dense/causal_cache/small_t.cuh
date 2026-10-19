@@ -77,11 +77,21 @@ __device__ __forceinline__ bool causal_valid_q_head(int kv_head, int q_head) {
            q_head < (kv_head + 1) * Geometry::GroupSize && q_head < Geometry::QHeads;
 }
 
+// T2 第二刀(2026-10-18): decode 域"每 split 覆盖 key 数"(window<=4096 tier)。
+// 曾试 32: 结构收益真实(rocprofv3 simt 核 31.8→21.9µs, 每轮 -4.5%)且 nospec +0.50%
+// (10/10 同号), 但 **d2 验收 1.77→1.65(-6.8%, 8 组重复确定性复现, md5 逐臂恒定)**
+// ⇒ 每 token 时间反升 2.4%(轮时=acc/tps 口径) ⇒ 按"数值未绿不默认开 / 主门口径不得回退"
+// 判负回退(d13b22e 源码部分撤销)。复现: bench/t2_sd_*.[sh] + /tmp/t2sd_watch.log。
+// 若重开: 可试 tokens 条件化(verify 域保持 64 组, 只 decode 域 32), 但轨迹同变, τ 未知。
+// **host twin(small_t.cu causal_small_t_split_upper_bound)必须同步**:它是 grid.y 上限,
+// 若小于设备 active 数,密度会被 grid 截回旧值(静默回退)。
+inline constexpr std::int32_t kSmallTDecodeKeysPerSplit = 64;
+
 template <typename Geometry>
 __device__ __forceinline__ int causal_small_t_default_splits(int window) {
     int target_keys_per_split = 480 / Geometry::SmallTSplitScale;
     if (window <= 4096) {
-        target_keys_per_split = 64 / Geometry::SmallTSplitScale;
+        target_keys_per_split = kSmallTDecodeKeysPerSplit / Geometry::SmallTSplitScale;
     } else if (window <= 8198) {
         target_keys_per_split = 128 / Geometry::SmallTSplitScale;
     } else if (window <= 16390) {
